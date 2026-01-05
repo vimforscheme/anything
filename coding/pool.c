@@ -76,20 +76,22 @@ static pthread_once_t key_once = PTHREAD_ONCE_INIT;
 /* ==========================================
  * 线程清理
  * ========================================== */
-
 static void thread_cleanup_handler(void *arg) {
-    (void)arg;
+    // 1. 强转 arg，这是正统做法
+    thread_cache_t *tc = (thread_cache_t *)arg;
 
-    if (!t_cache || t_cache->count == 0)
+    // 防御性检查：如果 Pthread 传空指针进来（虽然不应该），或者 count 为 0
+    if (!tc || tc->count == 0)
         goto out;
 
-    global_pool_t *pool = t_cache->global;
+    global_pool_t *pool = tc->global; // 这里的 tc 替代了 t_cache
 
-    free_node_t *head = (free_node_t *)t_cache->objects[0];
+    // 2. 下面的逻辑全部操作 tc
+    free_node_t *head = (free_node_t *)tc->objects[0];
     free_node_t *cur  = head;
 
-    for (int i = 1; i < t_cache->count; i++) {
-        cur->next = (free_node_t *)t_cache->objects[i];
+    for (int i = 1; i < tc->count; i++) {
+        cur->next = (free_node_t *)tc->objects[i];
         cur = cur->next;
     }
     cur->next = NULL;
@@ -108,8 +110,11 @@ static void thread_cleanup_handler(void *arg) {
     }
 
 out:
-    free(t_cache);
-    t_cache = NULL;
+    // 3. 释放内存
+    if (tc) free(tc);
+    
+    // 4. 把全局 TLS 置空，防止悬垂指针（虽然线程马上要销毁了，但这是好习惯）
+    t_cache = NULL; 
 }
 
 static void make_cleanup_key(void) {
