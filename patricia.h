@@ -17,9 +17,6 @@
 #endif
 
 #include <stdint.h>
-#include <string.h>
-#include <stdlib.h>
-#include <stdio.h>
 #include <stddef.h>
 
 #define RULE_PROTO_NUM 3 /* ICMP=0, TCP=1, UDP=2 */

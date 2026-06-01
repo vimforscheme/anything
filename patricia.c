@@ -1,7 +1,8 @@
 #include "patricia.h"
 #include <stdlib.h>
 #include <string.h>
-
+#include <stdlib.h>
+#include <stdio.h>
 void *(*patricia_alloc)(size_t) = malloc;
 void (*patricia_free)(void *) = free;
 
