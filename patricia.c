@@ -391,6 +391,55 @@ rule_t *acl_lookup(patricia_table_t *table, const void *addr, int af, uint8_t pr
     return best;
 }
 
+rule_t *acl_lookup_max(patricia_table_t *table, const void *addr, int af, uint8_t proto, uint16_t port)
+{
+    if (table == NULL || addr == NULL)
+        return NULL;
+
+    patricia_node_t *node = (af == AF_INET6) ? table->v6_root : table->v4_root;
+    int bit_len = (af == AF_INET6) ? 128 : 32;
+    int proto_idx = proto_to_idx(proto);
+    if (proto_idx < 0)
+        return NULL;
+
+    rule_t *last_matched_ip_rule = NULL;
+
+    /* 沿二进制路径单向线性下钻 */
+    while (node != NULL && node->bit < bit_len)
+    {
+        /* 只要沿途遇到了能够涵盖当前 IP 的合法资源组节点 */
+        if (node->is_end && prefix_match(addr, bit_len, node->key, node->prefix_bits))
+        {
+            rule_t *curr_rule = node->rules[proto_idx];
+            if (curr_rule != NULL)
+            {
+                last_matched_ip_rule = curr_rule; /* 暂存指针，用于 IP 命中但端口全不中时的保底 */
+
+                /* 核心最大兼容拦截：只要沿途任何一个大段或小段策略放行了该端口，
+                 * 或者当前是无端口概念的 ICMP 协议，直接断言成功，提前出栈放行！ */
+                if (proto == IPPROTO_ICMP || proto == IPPROTO_ICMPV6)
+                {
+                    return curr_rule;
+                }
+
+                if (port >= curr_rule->port_lo && port <= curr_rule->port_hi)
+                {
+                    return curr_rule;
+                }
+
+                /* 如果当前节点端口不匹配，绝不盲目拒绝！因为更浅的大段或更深的小段可能允许它 */
+            }
+        }
+        /* 顺着 GPS 位轨迹继续向下挖掘 */
+        node = (BIT_TEST(addr, node->bit) == 0) ? node->left : node->right;
+    }
+
+    /* 运行到此处说明：IP 确实落在了某些资源组内（last_matched_ip_rule != NULL），
+     * 但是沿途没有任何一个大段或小段的策略包容了当前的端口。
+     * 根据默认拒绝安全策略，此时才真正返回 NULL（拒绝访问） */
+    return NULL;
+}
+
 /**
  * 下述内容均为外部副作用函数，将startip-endip形式转换为前缀树支持的形式
  *

@@ -107,4 +107,8 @@ rule_t *acl_lookup(patricia_table_t *table,
 				   const void *addr, int af,
 				   uint8_t proto, uint16_t port);
 
+rule_t *acl_lookup_max(patricia_table_t *table,
+					   const void *addr, int af,
+					   uint8_t proto, uint16_t port);
+
 #endif /* PATRICIA_H */
