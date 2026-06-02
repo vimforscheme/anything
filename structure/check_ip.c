@@ -179,7 +179,7 @@ int get_packet_dst_info(const uint8_t *packet, size_t len, void *dst_ip, int *af
         }
         else
         {
-            *dst_port = 0; /* ICMP 协议无端口，刚性清0 */
+            *dst_port = 0; /* 所有其他协议 */
         }
         return 0;
     }
@@ -205,7 +205,7 @@ int get_packet_dst_info(const uint8_t *packet, size_t len, void *dst_ip, int *af
         }
         else
         {
-            *dst_port = 0; /* ICMPv6 协议无端口，刚性清0 */
+            *dst_port = 0; /* 所有其他协议 */
         }
         return 0;
     }
@@ -213,9 +213,9 @@ int get_packet_dst_info(const uint8_t *packet, size_t len, void *dst_ip, int *af
     return -1; /* 异常版本拦截 */
 }
 
-int process_incoming_packet(patricia_table_t *acl_table, const uint8_t *packet, size_t len)
+int check_one_packet_valid_2(patricia_table_t *acl_table, const uint8_t *packet, size_t len)
 {
-    /* 核心刚性防线：必须申请 16 字节缓冲区，最大兼容安全承载 IPv6 */
+    // todo如果没有规则（这里指的是 实际上下发的ip资源内容信息） 就直接return 0就行
     uint8_t dst_ip[16];
     int af = 0;
     uint16_t dst_port = 0;
@@ -223,10 +223,14 @@ int process_incoming_packet(patricia_table_t *acl_table, const uint8_t *packet, 
     ProtocolType proto = PROTO_UNKNOWN;
     if (get_packet_dst_info(packet, len, dst_ip, &af, &dst_port, &proto) != 0)
     {
-        // 报文畸形或遇到不支持的扩展头，直接就地击落（Drop）
-        return 1;
+        // 莫名奇妙的东西，不管他
+        return 0;
     }
-
+    if (proto == PROTO_UNKNOWN || proto == PROTO_ICMP)
+    {
+        // 非tcp udp协议无需比较
+        return 0;
+    }
     rule_t *match_rule = acl_lookup(acl_table, dst_ip, af, (uint8_t)proto, dst_port);
 
     if (match_rule != NULL)
