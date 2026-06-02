@@ -20,8 +20,14 @@ static inline int is_rule_duplicate(rule_link_t *head, rule_t *rule)
 {
     while (head != NULL)
     {
-        if (head->rule == rule)
-            return 1;
+        if (head->rule != NULL)
+        {
+            if (head->rule->port_lo == rule->port_lo &&
+                head->rule->port_hi == rule->port_hi)
+            {
+                return 1;
+            }
+        }
         head = head->next;
     }
     return 0;
