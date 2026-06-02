@@ -474,6 +474,49 @@ rule_t *acl_lookup(patricia_table_t *table, const void *addr, int af, uint8_t pr
     return NULL;
 }
 
+rule_t *acl_lookup_lpm(patricia_table_t *table, const void *addr, int af, uint8_t proto, uint16_t port)
+{
+    if (table == NULL || addr == NULL)
+        return NULL;
+
+    /* 1. 直接利用原有的 patricia_lpm 顺着压缩路径瞬间抓出最精确的那个节点的 rules 槽位阵列 */
+    patricia_node_t *root = (af == AF_INET6) ? table->v6_root : table->v4_root;
+    int bit_len = (af == AF_INET6) ? 128 : 32;
+
+    rule_link_t **best_rules = patricia_lpm(root, addr, bit_len);
+    if (best_rules == NULL)
+        return NULL; /* 连任何基础网络前缀都没撞上，直接拒绝 */
+
+    int proto_idx = proto_to_idx(proto);
+    if (proto_idx < 0)
+        return NULL;
+
+    /* 2. 单一匹配处理：有且仅对这一个最合适节点内部的横向链表执行区间测试 */
+    rule_link_t *curr_link = best_rules[proto_idx];
+    while (curr_link != NULL)
+    {
+        rule_t *curr_rule = curr_link->rule;
+        if (curr_rule != NULL)
+        {
+            /* ICMP 协议无端口概念，直接放行 */
+            if (proto == IPPROTO_ICMP || proto == IPPROTO_ICMPV6)
+            {
+                return curr_rule;
+            }
+            /* 干净利落的通用区间盲测 */
+            if (port >= curr_rule->port_lo && port <= curr_rule->port_hi)
+            {
+                return curr_rule;
+            }
+        }
+        curr_link = curr_link->next;
+    }
+
+    /* 核心差异：如果该最精确节点下的端口规则没对上，直接返回 NULL 拦截！
+     * 坚决不向路径上任何外层的、宏观的大前缀网段妥协，实现局部绝对特判 */
+    return NULL;
+}
+
 static void apply_cidr_mask(uint8_t *key, int bit_len, int max_bytes)
 {
     int bytes = bit_len / 8;

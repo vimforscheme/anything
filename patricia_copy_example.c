@@ -15,6 +15,9 @@
 #include <netinet/in.h>
 #endif
 
+/* 声明外部高级特判查找接口 */
+rule_t *acl_lookup_lpm(patricia_table_t *table, const void *addr, int af, uint8_t proto, uint16_t port);
+
 static rule_t *rule_new(uint8_t proto, uint16_t port_lo, uint16_t port_hi)
 {
 	rule_t *r = malloc(sizeof(*r));
@@ -125,7 +128,6 @@ int main(void)
 		check(patricia_delete(&table.v4_root, &a24, 24, 1, r1) == 0, "delete /24 TCP r1");
 		check(table.v4_root != NULL, "node structure intact: r1_b and r2 protect from deletion");
 		check(patricia_delete(&table.v4_root, &a24, 24, 1, r1_b) == 0, "delete /24 TCP r1_b");
-		/* 修正：不要在这里 free(r6)，它的生命周期应该延展到被树真正卸载之后 */
 	}
 
 	printf("\n=== Test 9: Complete tear down, tree empty ===\n");
@@ -137,13 +139,8 @@ int main(void)
 
 		check(patricia_delete(&table.v4_root, &a10, 8, 0, r5) == 0, "delete /8 ICMP r5");
 		check(patricia_delete(&table.v4_root, &a192_16, 16, 1, r4) == 0, "delete /16 TCP r4");
-
-		/* ─── 核心修正：补上此前漏掉的这一步，干干净净剥离挂在 /16 节点上的 r6 ─── */
 		check(patricia_delete(&table.v4_root, &a192_16, 16, 2, r6) == 0, "delete /16 UDP r6");
-
 		check(patricia_delete(&table.v4_root, &a192_24, 24, 2, r2) == 0, "delete /24 UDP r2");
-
-		/* 此时所有规则被百分之百彻底榨干，树完美级联塌陷归零 */
 		check(table.v4_root == NULL, "v4 tree is now completely empty and collapsed");
 	}
 
@@ -160,12 +157,16 @@ int main(void)
 		check(patricia_insert(&table.v6_root, v6addr, 64, r7, 1) == 0, "insert IPv6 /64");
 		check(table.v6_root != NULL, "v6 root exists");
 		check(table.v6_root->bit == 63, "v6 node bit compressed perfectly");
-
 		{
 			rule_link_t **res_links = patricia_lpm(table.v6_root, v6addr, 128);
 			check(res_links != NULL && res_links[1] != NULL && res_links[1]->rule == r7, "v6 LPM finds /64 rule link");
 		}
-		free(r7);
+
+		/* 核心修补：在 free 之前，必须调用 delete 将资产从容器骨架中摘除，让树自然坍缩折叠 */
+		check(patricia_delete(&table.v6_root, v6addr, 64, 1, r7) == 0, "delete /64 IPv6 r7");
+		check(table.v6_root == NULL, "v6 tree is now completely empty and collapsed");
+
+		free(r7); /* 树里没它了，此时才可以安全地回归外部账本释放物理资产 */
 	}
 
 	printf("\n=== Test 11: ACL lookup with horizontal chain interval match ===\n");
@@ -188,20 +189,105 @@ int main(void)
 	inet_pton(AF_INET, "10.1.2.3", &ip4);
 	check(acl_lookup(&table, &ip4, AF_INET, IPPROTO_ICMP, 999) == r9, "ICMP port=999 ignored -> hit");
 
+	printf("\n=== Test 13: acl_lookup_lpm Exclusive Specific Match Proof ===\n");
+	uint32_t ip4_broad, ip4_narrow, ip4_test;
+	inet_pton(AF_INET, "192.168.0.0", &ip4_broad);
+	inet_pton(AF_INET, "192.168.3.0", &ip4_narrow);
+	inet_pton(AF_INET, "192.168.3.100", &ip4_test);
+
+	rule_t *r_broad = rule_new(IPPROTO_TCP, 80, 80);
+	rule_t *r_narrow = rule_new(IPPROTO_TCP, 443, 443);
+
+	patricia_insert(&table.v4_root, &ip4_broad, 16, r_broad, 1);
+	patricia_insert(&table.v4_root, &ip4_narrow, 24, r_narrow, 1);
+
+	check(acl_lookup(&table, &ip4_test, AF_INET, IPPROTO_TCP, 80) == r_broad,
+		  "acl_lookup [Broad Union]: Port 80 matches parent /16 -> HIT");
+	check(acl_lookup_lpm(&table, &ip4_test, AF_INET, IPPROTO_TCP, 80) == NULL,
+		  "acl_lookup_lpm [Strict One]: Port 80 on narrowest /24 is unmapped -> MISS (Blocked)");
+	check(acl_lookup_lpm(&table, &ip4_test, AF_INET, IPPROTO_TCP, 443) == r_narrow,
+		  "acl_lookup_lpm [Strict One]: Port 443 on narrowest /24 -> HIT");
+
+	/* ─── 🛠️ 重点扩容一：Test 14 IPv4 任意不合规范围自动化切碎与批量合并测试 ─── */
+	printf("\n=== Test 14: patricia_insert_range_v4 Split & Lookup Verification ===\n");
+	/* 192.168.1.3 到 192.168.1.9 (主机序传入) */
+	uint32_t r4_start = (192 << 24) | (168 << 16) | (1 << 8) | 3;
+	uint32_t r4_end = (192 << 24) | (168 << 16) | (1 << 8) | 9;
+	rule_t *r_range_v4 = rule_new(IPPROTO_TCP, 8080, 8080);
+
+	check(patricia_insert_range_v4(&table.v4_root, r4_start, r4_end, r_range_v4, 1) == 0,
+		  "insert arbitrary range v4 (192.168.1.3 - 192.168.1.9)");
+
+	uint32_t ip_test_v4;
+	/* 区间下限外部点测试 */
+	inet_pton(AF_INET, "192.168.1.2", &ip_test_v4);
+	check(acl_lookup(&table, &ip_test_v4, AF_INET, IPPROTO_TCP, 8080) == NULL, "192.168.1.2 (Below Range Boundary) -> MISS");
+
+	/* 区间下限临界点测试 (/32 独立块) */
+	inet_pton(AF_INET, "192.168.1.3", &ip_test_v4);
+	check(acl_lookup(&table, &ip_test_v4, AF_INET, IPPROTO_TCP, 8080) == r_range_v4, "192.168.1.3 (Start Border Block) -> HIT");
+
+	/* 区间内部隐藏跨度点测试 (/30 复合大块内部点) */
+	inet_pton(AF_INET, "192.168.1.6", &ip_test_v4);
+	check(acl_lookup(&table, &ip_test_v4, AF_INET, IPPROTO_TCP, 8080) == r_range_v4, "192.168.1.6 (Inside Compressed Block) -> HIT");
+
+	/* 区间上限临界点测试 (/31 尾部块) */
+	inet_pton(AF_INET, "192.168.1.9", &ip_test_v4);
+	check(acl_lookup(&table, &ip_test_v4, AF_INET, IPPROTO_TCP, 8080) == r_range_v4, "192.168.1.9 (End Border Block) -> HIT");
+
+	/* 区间上限外部点测试 */
+	inet_pton(AF_INET, "192.168.1.10", &ip_test_v4);
+	check(acl_lookup(&table, &ip_test_v4, AF_INET, IPPROTO_TCP, 8080) == NULL, "192.168.1.10 (Above Range Boundary) -> MISS");
+
+	/* ─── 🛠️ 重点扩容二：Test 15 IPv6 128位大数范围自动化切碎与批量合并测试 ─── */
+	printf("\n=== Test 15: patricia_insert_range_v6 Split & Lookup Verification ===\n");
+	/* 2001:db8::3 到 2001:db8::9 (大端内存数组传入) */
+	uint8_t r6_start[16] = {0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x03};
+	uint8_t r6_end[16] = {0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x09};
+	rule_t *r_range_v6 = rule_new(IPPROTO_TCP, 8443, 8443);
+
+	check(patricia_insert_range_v6(&table.v6_root, r6_start, r6_end, r_range_v6, 1) == 0,
+		  "insert arbitrary range v6 (2001:db8::3 - 2001:db8::9)");
+
+	uint8_t ip_test_v6[16];
+	/* IPv6 区间下限外部点测试 */
+	inet_pton(AF_INET6, "2001:db8::2", ip_test_v6);
+	check(acl_lookup(&table, ip_test_v6, AF_INET6, IPPROTO_TCP, 8443) == NULL, "2001:db8::2 (Below Range Boundary) -> MISS");
+
+	/* IPv6 区间下限临界点测试 */
+	inet_pton(AF_INET6, "2001:db8::3", ip_test_v6);
+	check(acl_lookup(&table, ip_test_v6, AF_INET6, IPPROTO_TCP, 8443) == r_range_v6, "2001:db8::3 (Start Border Block) -> HIT");
+
+	/* IPv6 区间内部隐藏跨度点测试 */
+	inet_pton(AF_INET6, "2001:db8::6", ip_test_v6);
+	check(acl_lookup(&table, ip_test_v6, AF_INET6, IPPROTO_TCP, 8443) == r_range_v6, "2001:db8::6 (Inside Compressed Block) -> HIT");
+
+	/* IPv6 区间上限临界点测试 */
+	inet_pton(AF_INET6, "2001:db8::9", ip_test_v6);
+	check(acl_lookup(&table, ip_test_v6, AF_INET6, IPPROTO_TCP, 8443) == r_range_v6, "2001:db8::9 (End Border Block) -> HIT");
+
+	/* IPv6 区间上限外部点测试 */
+	inet_pton(AF_INET6, "2001:db8::a", ip_test_v6);
+	check(acl_lookup(&table, ip_test_v6, AF_INET6, IPPROTO_TCP, 8443) == NULL, "2001:db8::a (Above Range Boundary) -> MISS");
+
 	printf("\n=== Cleanup ===\n");
 	patricia_destroy(table.v4_root);
 	patricia_destroy(table.v6_root);
 
-	printf("All 12 tests complete.\n");
+	printf("All 15 tests complete.\n");
 	free(r1);
 	free(r1_b);
 	free(r2);
 	free(r3);
 	free(r4);
 	free(r5);
-	free(r6); /* 在最外层纯净账本处安全释放物理实体 */
+	free(r6);
 	free(r8_high);
 	free(r8_low);
 	free(r9);
+	free(r_broad);
+	free(r_narrow);
+	free(r_range_v4);
+	free(r_range_v6); /* 清洗释放新增区间测试的物理资产 */
 	return 0;
 }
