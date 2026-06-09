@@ -1,11 +1,12 @@
 #include "patricia.h"
 #include <stdlib.h>
 #include <string.h>
-#include <stdlib.h>
 #include <stdio.h>
+
 void *(*patricia_alloc)(size_t) = malloc;
 void (*patricia_free)(void *) = free;
-
+rule_l3vpn_t g_l3vpn_rules = {0};
+patricia_table_t g_ip_table = {0};
 static patricia_node_t *alloc_node(int bit)
 {
     patricia_node_t *node = patricia_alloc(sizeof(*node));
@@ -16,6 +17,23 @@ static patricia_node_t *alloc_node(int bit)
     return node;
 }
 
+static inline int is_rule_duplicate(rule_link_t *head, rule_t *rule)
+{
+    while (head != NULL)
+    {
+        if (head->rule != NULL)
+        {
+            if (head->rule->port_lo == rule->port_lo &&
+                head->rule->port_hi == rule->port_hi)
+            {
+                return 1;
+            }
+        }
+        head = head->next;
+    }
+    return 0;
+}
+
 static patricia_node_t *make_leaf(const void *key, int bit_len, rule_t *rule, int proto_idx)
 {
     int key_bytes = (bit_len + 7) / 8;
@@ -23,17 +41,27 @@ static patricia_node_t *make_leaf(const void *key, int bit_len, rule_t *rule, in
     if (node == NULL)
         return NULL;
 
+    rule_link_t *link = patricia_alloc(sizeof(*link));
+    if (link == NULL)
+    {
+        patricia_free(node);
+        return NULL;
+    }
+    link->rule = rule;
+    link->next = NULL;
+
     node->key = patricia_alloc(key_bytes);
     if (node->key == NULL)
     {
+        patricia_free(link);
         patricia_free(node);
         return NULL;
     }
     memcpy(node->key, key, key_bytes);
     node->key_len = key_bytes;
-    node->prefix_bits = bit_len; /* 精准记录位长，攻克任意位限制 */
+    node->prefix_bits = bit_len;
     node->is_end = 1;
-    node->rules[proto_idx] = rule;
+    node->rules[proto_idx] = link;
     return node;
 }
 
@@ -65,14 +93,26 @@ static int find_first_diff_bit(const uint8_t *a, int a_bits, const uint8_t *b, i
     return max;
 }
 
+/* 核心优化：改用显式栈执行非递归迭代搜索，彻底杜绝 IPv6 深树下的栈溢出隐患 */
 static patricia_node_t *find_any_is_end(patricia_node_t *node)
 {
     if (node == NULL)
         return NULL;
-    if (node->is_end)
-        return node;
-    patricia_node_t *found = find_any_is_end(node->left);
-    return (found != NULL) ? found : find_any_is_end(node->right);
+    patricia_node_t *stack[PATRICIA_MAX_DEPTH * 2];
+    int top = 0;
+    stack[top++] = node;
+
+    while (top > 0)
+    {
+        patricia_node_t *curr = stack[--top];
+        if (curr->is_end)
+            return curr;
+        if (curr->right != NULL)
+            stack[top++] = curr->right;
+        if (curr->left != NULL)
+            stack[top++] = curr->left;
+    }
+    return NULL;
 }
 
 void patricia_init_table(patricia_table_t *table) { memset(table, 0, sizeof(*table)); }
@@ -83,15 +123,26 @@ void patricia_destroy(patricia_node_t *root)
         return;
     patricia_destroy(root->left);
     patricia_destroy(root->right);
+
+    for (int i = 0; i < RULE_PROTO_NUM; i++)
+    {
+        rule_link_t *link = root->rules[i];
+        while (link != NULL)
+        {
+            rule_link_t *next_link = link->next;
+            patricia_free(link);
+            link = next_link;
+        }
+    }
+
     if (root->key != NULL)
         patricia_free(root->key);
     patricia_free(root);
 }
 
-/* ─── 完美闭环的两阶段（Two-Pass）插入 ─── */
 int patricia_insert(patricia_node_t **root, const void *key, int bit_len, rule_t *rule, int proto_idx)
 {
-    if (root == NULL || key == NULL || bit_len <= 0)
+    if (root == NULL || key == NULL || bit_len <= 0 || bit_len > 128)
         return -1;
     if (proto_idx < 0 || proto_idx >= RULE_PROTO_NUM)
         return -1;
@@ -102,11 +153,10 @@ int patricia_insert(patricia_node_t **root, const void *key, int bit_len, rule_t
         return (*root != NULL) ? 0 : -1;
     }
 
-    /* Phase 1: 一沉到底，基于位决策找到拓扑上最邻近的节点 */
     patricia_node_t *node = *root;
     while (node->left != NULL || node->right != NULL)
     {
-        int b = BIT_TEST(key, node->bit); // 始终按 key 的实际位走
+        int b = BIT_TEST(key, node->bit);
         if (b == 0)
         {
             if (node->left == NULL)
@@ -125,22 +175,30 @@ int patricia_insert(patricia_node_t **root, const void *key, int bit_len, rule_t
     if (closest == NULL)
         closest = find_any_is_end(*root);
 
-    /* Phase 2: 比对最邻近节点，锁定真实分叉位 */
     int diff_bit = find_first_diff_bit(key, bit_len, closest->key, closest->prefix_bits);
 
-    /* 场景 A: 精确命中路径上已有的规则节点 (原位覆盖或填充规则) */
+    /* 路径 1：精确匹配去重并执行头插法 */
     if (diff_bit >= bit_len && diff_bit >= closest->prefix_bits)
     {
+        if (is_rule_duplicate(closest->rules[proto_idx], rule))
+            return 0;
+        rule_link_t *link = patricia_alloc(sizeof(*link));
+        if (link == NULL)
+            return -1;
+        link->rule = rule;
+        link->next = closest->rules[proto_idx];
+        closest->rules[proto_idx] = link;
         closest->is_end = 1;
-        closest->rules[proto_idx] = rule;
         return 0;
     }
 
     int insert_bit = (diff_bit >= bit_len) ? (bit_len - 1) : diff_bit;
 
-    /* ─── 补丁 1: 根节点恰好是我们要找的相同 bit 纯内部节点 -> 直接原地升级 ─── */
+    /* 路径 2：根节点升级去重并执行头插法 */
     if ((*root)->bit == insert_bit && diff_bit >= bit_len)
     {
+        if (is_rule_duplicate((*root)->rules[proto_idx], rule))
+            return 0;
         if (!(*root)->is_end)
         {
             int key_bytes = (bit_len + 7) / 8;
@@ -151,12 +209,16 @@ int patricia_insert(patricia_node_t **root, const void *key, int bit_len, rule_t
             (*root)->key_len = key_bytes;
             (*root)->prefix_bits = bit_len;
         }
+        rule_link_t *link = patricia_alloc(sizeof(*link));
+        if (link == NULL)
+            return -1;
+        link->rule = rule;
+        link->next = (*root)->rules[proto_idx];
+        (*root)->rules[proto_idx] = link;
         (*root)->is_end = 1;
-        (*root)->rules[proto_idx] = rule;
         return 0;
     }
 
-    /* 场景 C: 沿途下钻，精确定位分裂点 */
     patricia_node_t *p = *root;
     while (p->bit < insert_bit)
     {
@@ -170,9 +232,11 @@ int patricia_insert(patricia_node_t **root, const void *key, int bit_len, rule_t
     int b_p = BIT_TEST(key, p->bit);
     patricia_node_t *child = (b_p == 0) ? p->left : p->right;
 
-    /* ─── 补丁 2: 子节点恰好是相同 bit 纯内部节点 -> 原地升级，拒绝夹塞避免断链 ─── */
+    /* 路径 3：子节点升级去重并执行头插法 */
     if (child != NULL && child->bit == insert_bit && diff_bit >= bit_len)
     {
+        if (is_rule_duplicate(child->rules[proto_idx], rule))
+            return 0;
         if (!child->is_end)
         {
             int key_bytes = (bit_len + 7) / 8;
@@ -183,17 +247,20 @@ int patricia_insert(patricia_node_t **root, const void *key, int bit_len, rule_t
             child->key_len = key_bytes;
             child->prefix_bits = bit_len;
         }
+        rule_link_t *link = patricia_alloc(sizeof(*link));
+        if (link == NULL)
+            return -1;
+        link->rule = rule;
+        link->next = child->rules[proto_idx];
+        child->rules[proto_idx] = link;
         child->is_end = 1;
-        child->rules[proto_idx] = rule;
         return 0;
     }
 
-    /* ─── 只有上述原地升级都不触发时，才真正建立新 leaf 节点进行夹塞或标准分叉 ─── */
     patricia_node_t *leaf = make_leaf(key, bit_len, rule, proto_idx);
     if (leaf == NULL)
         return -1;
 
-    /* 场景 B: 作为全新的根祖先插入（缩短现有整树的前缀） */
     if ((*root)->bit > insert_bit)
     {
         int b_exist = BIT_TEST(closest->key, insert_bit);
@@ -208,7 +275,6 @@ int patricia_insert(patricia_node_t **root, const void *key, int bit_len, rule_t
 
     if (diff_bit >= bit_len)
     {
-        /* 纯祖先夹塞：此时 child 必然是严格大于 insert_bit 的深层子树，完美夹在 p 和 child 之间 */
         int b_exist = BIT_TEST(closest->key, insert_bit);
         if (b_exist == 0)
             leaf->left = child;
@@ -222,13 +288,7 @@ int patricia_insert(patricia_node_t **root, const void *key, int bit_len, rule_t
     }
     else
     {
-        /* 标准分叉：新 key 和最邻近节点在 diff_bit 处分道扬镳 */
         int b_new = BIT_TEST(key, diff_bit);
-
-        /* ─── 终极精确优化 ───
-         * 如果下层 child 节点的测试位正好等于分叉位 diff_bit，
-         * 说明路由占位符已存在。根据严格的拓扑反证法，其 b_new 方向必为空槽。
-         * 直接安全地原位填空，拒绝繁衍冗余节点，且绝不破坏已有子树！ */
         if (child != NULL && child->bit == diff_bit)
         {
             if (b_new == 0)
@@ -238,9 +298,6 @@ int patricia_insert(patricia_node_t **root, const void *key, int bit_len, rule_t
             return 0;
         }
 
-        /* ─── 常规分叉 ───
-         * 如果 child == NULL 或者 child->bit > diff_bit，说明此处是一片空白，
-         * 必须老老实实繁衍一个新的内部路由节点来挑起两边的分叉。 */
         patricia_node_t *new_internal = alloc_node(diff_bit);
         if (new_internal == NULL)
         {
@@ -258,26 +315,25 @@ int patricia_insert(patricia_node_t **root, const void *key, int bit_len, rule_t
     return 0;
 }
 
-rule_t **patricia_search(patricia_node_t *root, const void *key, int bit_len)
+/* 优化：精确匹配具备唯一性，命中后立即提前返回，避免冗余下钻 */
+rule_link_t **patricia_search(patricia_node_t *root, const void *key, int bit_len)
 {
     patricia_node_t *node = root;
-    patricia_node_t *target = NULL;
-
     while (node != NULL && node->bit < bit_len)
     {
         if (node->is_end && node->prefix_bits == bit_len && memcmp(node->key, key, node->key_len) == 0)
         {
-            target = node;
+            return node->rules;
         }
         node = (BIT_TEST(key, node->bit) == 0) ? node->left : node->right;
     }
-    return (target != NULL) ? target->rules : NULL;
+    return NULL;
 }
 
-rule_t **patricia_lpm(patricia_node_t *root, const void *key, int bit_len)
+rule_link_t **patricia_lpm(patricia_node_t *root, const void *key, int bit_len)
 {
     patricia_node_t *node = root;
-    rule_t **best = NULL;
+    rule_link_t **best = NULL;
 
     while (node != NULL && node->bit < bit_len)
     {
@@ -290,16 +346,19 @@ rule_t **patricia_lpm(patricia_node_t *root, const void *key, int bit_len)
     return best;
 }
 
-int patricia_delete(patricia_node_t **root, const void *key, int bit_len, int proto_idx)
+/* 优化：引入刚性运行期防御拦截，完美防止路径深度突破边界 */
+int patricia_delete(patricia_node_t **root, const void *key, int bit_len, int proto_idx, rule_t *rule)
 {
-    patricia_node_t *path[128], *target = NULL, *node = *root;
-    int dirs[128], depth = 0, target_depth = -1;
+    patricia_node_t *path[PATRICIA_MAX_DEPTH * 2], *target = NULL, *node = *root;
+    int dirs[PATRICIA_MAX_DEPTH * 2], depth = 0, target_depth = -1;
 
-    if (root == NULL || *root == NULL || key == NULL)
+    if (root == NULL || *root == NULL || key == NULL || rule == NULL)
         return -1;
 
     while (node != NULL && node->bit < bit_len)
     {
+        if (depth >= PATRICIA_MAX_DEPTH * 2)
+            return -1; /* 刚性核心安全防护 */
         if (node->is_end && node->prefix_bits == bit_len && memcmp(node->key, key, node->key_len) == 0)
         {
             target = node;
@@ -312,21 +371,37 @@ int patricia_delete(patricia_node_t **root, const void *key, int bit_len, int pr
         node = (b == 0) ? node->left : node->right;
     }
 
-    if (target == NULL || target->rules[proto_idx] == NULL)
+    if (target == NULL)
         return -1;
 
-    target->rules[proto_idx] = NULL;
+    rule_link_t **pp = &target->rules[proto_idx];
+    int found = 0;
+    while (*pp != NULL)
+    {
+        if ((*pp)->rule == rule)
+        {
+            rule_link_t *to_free = *pp;
+            *pp = (*pp)->next;
+            patricia_free(to_free);
+            found = 1;
+            break;
+        }
+        pp = &(*pp)->next;
+    }
+
+    if (!found)
+        return -1;
+
     for (int i = 0; i < RULE_PROTO_NUM; i++)
     {
         if (target->rules[i] != NULL)
-            return 0; /* 还有其他协议存活 */
+            return 0;
     }
 
     target->is_end = 0;
     patricia_free(target->key);
     target->key = NULL;
 
-    /* 闭环处理：节点收缩与路径压缩 */
     if ((target->left != NULL) != (target->right != NULL))
     {
         patricia_node_t *child = (target->left != NULL) ? target->left : target->right;
@@ -337,6 +412,8 @@ int patricia_delete(patricia_node_t **root, const void *key, int bit_len, int pr
         else
             path[target_depth - 1]->right = child;
         patricia_free(target);
+        if (target_depth >= 0)
+            path[target_depth] = NULL;
     }
     else if (target->left == NULL && target->right == NULL)
     {
@@ -347,9 +424,10 @@ int patricia_delete(patricia_node_t **root, const void *key, int bit_len, int pr
         else
             path[target_depth - 1]->right = NULL;
         patricia_free(target);
+        if (target_depth >= 0)
+            path[target_depth] = NULL;
     }
 
-    /* 向上级联收缩 */
     for (int i = target_depth - 1; i >= 0; i--)
     {
         patricia_node_t *p = path[i];
@@ -364,34 +442,12 @@ int patricia_delete(patricia_node_t **root, const void *key, int bit_len, int pr
         else
             gp->right = child;
         patricia_free(p);
+        path[i] = NULL;
     }
     return 0;
 }
 
 rule_t *acl_lookup(patricia_table_t *table, const void *addr, int af, uint8_t proto, uint16_t port)
-{
-    patricia_node_t *root = (af == AF_INET6) ? table->v6_root : table->v4_root;
-    int bit_len = (af == AF_INET6) ? 128 : 32;
-    int proto_idx = proto_to_idx(proto);
-    if (proto_idx < 0)
-        return NULL;
-
-    rule_t **rules = patricia_lpm(root, addr, bit_len);
-    if (rules == NULL)
-        return NULL;
-
-    rule_t *best = rules[proto_idx];
-    if (best == NULL)
-        return NULL;
-    if (proto != IPPROTO_ICMP && proto != IPPROTO_ICMPV6)
-    {
-        if (port < best->port_lo || port > best->port_hi)
-            return NULL;
-    }
-    return best;
-}
-
-rule_t *acl_lookup_max(patricia_table_t *table, const void *addr, int af, uint8_t proto, uint16_t port)
 {
     if (table == NULL || addr == NULL)
         return NULL;
@@ -402,52 +458,72 @@ rule_t *acl_lookup_max(patricia_table_t *table, const void *addr, int af, uint8_
     if (proto_idx < 0)
         return NULL;
 
-    rule_t *last_matched_ip_rule = NULL;
-
-    /* 沿二进制路径单向线性下钻 */
     while (node != NULL && node->bit < bit_len)
     {
-        /* 只要沿途遇到了能够涵盖当前 IP 的合法资源组节点 */
         if (node->is_end && prefix_match(addr, bit_len, node->key, node->prefix_bits))
         {
-            rule_t *curr_rule = node->rules[proto_idx];
-            if (curr_rule != NULL)
+            rule_link_t *curr_link = node->rules[proto_idx];
+            while (curr_link != NULL)
             {
-                last_matched_ip_rule = curr_rule; /* 暂存指针，用于 IP 命中但端口全不中时的保底 */
-
-                /* 核心最大兼容拦截：只要沿途任何一个大段或小段策略放行了该端口，
-                 * 或者当前是无端口概念的 ICMP 协议，直接断言成功，提前出栈放行！ */
-                if (proto == IPPROTO_ICMP || proto == IPPROTO_ICMPV6)
+                rule_t *curr_rule = curr_link->rule;
+                if (curr_rule != NULL)
                 {
-                    return curr_rule;
+                    if (proto == IPPROTO_ICMP || proto == IPPROTO_ICMPV6)
+                        return curr_rule;
+                    if (port >= curr_rule->port_lo && port <= curr_rule->port_hi)
+                        return curr_rule;
                 }
-
-                if (port >= curr_rule->port_lo && port <= curr_rule->port_hi)
-                {
-                    return curr_rule;
-                }
-
-                /* 如果当前节点端口不匹配，绝不盲目拒绝！因为更浅的大段或更深的小段可能允许它 */
+                curr_link = curr_link->next;
             }
         }
-        /* 顺着 GPS 位轨迹继续向下挖掘 */
         node = (BIT_TEST(addr, node->bit) == 0) ? node->left : node->right;
     }
-
-    /* 运行到此处说明：IP 确实落在了某些资源组内（last_matched_ip_rule != NULL），
-     * 但是沿途没有任何一个大段或小段的策略包容了当前的端口。
-     * 根据默认拒绝安全策略，此时才真正返回 NULL（拒绝访问） */
     return NULL;
 }
 
-/**
- * 下述内容均为外部副作用函数，将startip-endip形式转换为前缀树支持的形式
- *
- */
+rule_t *acl_lookup_lpm(patricia_table_t *table, const void *addr, int af, uint8_t proto, uint16_t port)
+{
+    if (table == NULL || addr == NULL)
+        return NULL;
 
-/**
- * 内部辅助函数：自动对二进制 Key 进行网络掩码裁剪，防止主机位污染边界
- */
+    /* 1. 直接利用原有的 patricia_lpm 顺着压缩路径瞬间抓出最精确的那个节点的 rules 槽位阵列 */
+    patricia_node_t *root = (af == AF_INET6) ? table->v6_root : table->v4_root;
+    int bit_len = (af == AF_INET6) ? 128 : 32;
+
+    rule_link_t **best_rules = patricia_lpm(root, addr, bit_len);
+    if (best_rules == NULL)
+        return NULL; /* 连任何基础网络前缀都没撞上，直接拒绝 */
+
+    int proto_idx = proto_to_idx(proto);
+    if (proto_idx < 0)
+        return NULL;
+
+    /* 2. 单一匹配处理：有且仅对这一个最合适节点内部的横向链表执行区间测试 */
+    rule_link_t *curr_link = best_rules[proto_idx];
+    while (curr_link != NULL)
+    {
+        rule_t *curr_rule = curr_link->rule;
+        if (curr_rule != NULL)
+        {
+            /* ICMP 协议无端口概念，直接放行 */
+            if (proto == IPPROTO_ICMP || proto == IPPROTO_ICMPV6)
+            {
+                return curr_rule;
+            }
+            /* 干净利落的通用区间盲测 */
+            if (port >= curr_rule->port_lo && port <= curr_rule->port_hi)
+            {
+                return curr_rule;
+            }
+        }
+        curr_link = curr_link->next;
+    }
+
+    /* 核心差异：如果该最精确节点下的端口规则没对上，直接返回 NULL 拦截！
+     * 坚决不向路径上任何外层的、宏观的大前缀网段妥协，实现局部绝对特判 */
+    return NULL;
+}
+
 static void apply_cidr_mask(uint8_t *key, int bit_len, int max_bytes)
 {
     int bytes = bit_len / 8;
@@ -458,36 +534,23 @@ static void apply_cidr_mask(uint8_t *key, int bit_len, int max_bytes)
         if (rem > 0)
         {
             uint8_t mask = (uint8_t)(0xFF << (8 - rem));
-            key[bytes] &= mask; /* 清洗当前非整字节的剩余主机位 */
+            key[bytes] &= mask;
             bytes++;
         }
-        /* 将完全属于主机位的后续字节全部清零 */
         while (bytes < max_bytes)
-        {
             key[bytes++] = 0;
-        }
     }
 }
 
-/**
- * 跨平台 CIDR 字符串解析器
- * @param cidr_str 输入的原始 IP 字符串（例如 "192.168.3.5/22" 或 "2001:db8::/64" 或单点主机 "10.1.1.1"）
- * @param out_meta 转换要素的落地方
- * @return 0 成功, -1 格式非法或解析失败
- */
-int patricia_parse_cidr(const char *cidr_str, patricia_insert_meta_t *out_meta)
+static int patricia_parse_cidr(const char *cidr_str, patricia_insert_meta_t *out_meta)
 {
     if (cidr_str == NULL || out_meta == NULL)
-    {
         return -1;
-    }
 
-    /* 1. 安全复制字符串，避免破坏用户传入的原始指针 */
     char buf[128];
     strncpy(buf, cidr_str, sizeof(buf) - 1);
     buf[sizeof(buf) - 1] = '\0';
 
-    /* 2. 检索并切分 '/' 掩码符号 */
     char *slash = strchr(buf, '/');
     int explicit_bits = -1;
     if (slash != NULL)
@@ -498,108 +561,68 @@ int patricia_parse_cidr(const char *cidr_str, patricia_insert_meta_t *out_meta)
 
     memset(out_meta, 0, sizeof(*out_meta));
 
-    /* 3. 跨平台智能探测与转换 */
-    // 尝试解析为 IPv4
     struct in_addr v4addr;
     if (inet_pton(AF_INET, buf, &v4addr) == 1)
     {
         out_meta->af = AF_INET;
         out_meta->bit_len = (explicit_bits >= 0) ? explicit_bits : 32;
-
         if (out_meta->bit_len < 0 || out_meta->bit_len > 32)
-        {
-            return -1; /* 掩码范围非法 */
-        }
+            return -1;
 
         memcpy(out_meta->key_bin, &v4addr.s_addr, 4);
-        /* 自动清洗主机位（如将 192.168.3.5/22 规范化为 192.168.0.0/22） */
         apply_cidr_mask(out_meta->key_bin, out_meta->bit_len, 4);
         return 0;
     }
 
-    // 尝试解析为 IPv6
     struct in6_addr v6addr;
     if (inet_pton(AF_INET6, buf, &v6addr) == 1)
     {
         out_meta->af = AF_INET6;
         out_meta->bit_len = (explicit_bits >= 0) ? explicit_bits : 128;
-
         if (out_meta->bit_len < 0 || out_meta->bit_len > 128)
-        {
-            return -1; /* 掩码范围非法 */
-        }
+            return -1;
 
         memcpy(out_meta->key_bin, &v6addr, 16);
-        /* 自动清洗 IPv6 主机位 */
         apply_cidr_mask(out_meta->key_bin, out_meta->bit_len, 16);
         return 0;
     }
-
-    return -1; /* 既不是合法的 v4 也不是合法的 v6 */
+    return -1;
 }
 
-/**
- * 业务层统一规则配置总封装
- */
 int acl_add_rule_string(patricia_table_t *table, const char *cidr_str, rule_t *rule)
 {
     patricia_insert_meta_t meta;
-
-    // 1. 调用前置转换器提取要素
     if (patricia_parse_cidr(cidr_str, &meta) != 0)
-    {
-        fprintf(stderr, "Error: Invalid CIDR format '%s'\n", cidr_str);
         return -1;
-    }
 
-    // 根据不同的协议类型判定插入槽位
     int proto_idx = proto_to_idx(rule->proto);
     if (proto_idx < 0)
         return -1;
 
-    // 2. 完美无缝对接底层的 patricia_insert
     if (meta.af == AF_INET)
-    {
-        // 对接 v4_root 树根，传入清洗后的 key_bin 和精确位长
         return patricia_insert(&table->v4_root, meta.key_bin, meta.bit_len, rule, proto_idx);
-    }
     else if (meta.af == AF_INET6)
-    {
-        // 对接 v6_root 树根
         return patricia_insert(&table->v6_root, meta.key_bin, meta.bit_len, rule, proto_idx);
-    }
-
     return -1;
 }
 
-/* ─── IPv4 任意范围自动切分并安全插入（修复全网段全跨度溢出） ─── */
-int patricia_insert_range_v4(patricia_node_t **root,
-                             uint32_t start_host, uint32_t end_host,
-                             rule_t *rule, int proto_idx)
+int patricia_insert_range_v4(patricia_node_t **root, uint32_t start_host, uint32_t end_host, rule_t *rule, int proto_idx)
 {
     if (root == NULL || start_host > end_host)
         return -1;
 
     while (start_host <= end_host)
     {
-        /* 提升到 64 位计算 span，完美支持全网 0x100000000ULL 跨度 */
         uint64_t span = (uint64_t)end_host - start_host + 1;
-
-        /* 提取 start_host 末尾连续 0 能支持的最大 2 的幂次方块 */
         uint64_t block64 = start_host ? (start_host & (-start_host)) : 0x100000000ULL;
 
-        /* 如果当前对齐块越界超出了剩余的跨度 span */
         if (block64 > span)
         {
-            /* 寻找小于或等于 span 的最大 2 的幂次方块 */
             block64 = 1;
             while (block64 <= span / 2)
-            {
                 block64 <<= 1;
-            }
         }
 
-        /* 计算当前对齐块对应的 CIDR 掩码位长 */
         int shift = 0;
         uint64_t temp = block64;
         while (temp > 1)
@@ -609,17 +632,12 @@ int patricia_insert_range_v4(patricia_node_t **root,
         }
         int bit_len = 32 - shift;
 
-        /* 调用定版的无懈可击的两阶段插入函数 */
         uint32_t ip_net = htonl(start_host);
         if (patricia_insert(root, &ip_net, bit_len, rule, proto_idx) != 0)
-        {
             return -1;
-        }
 
-        /* 如果本次插入的 block 已经完全覆盖了剩余跨度，直接完美退出 */
         if (span == block64)
             break;
-
         start_host += (uint32_t)block64;
     }
     return 0;
@@ -634,15 +652,11 @@ static inline int compare_128(uint64_t a_hi, uint64_t a_lo, uint64_t b_hi, uint6
     return 0;
 }
 
-/* ─── IPv6 128位大数纯算术最优切分（完美支持 MSVC / GCC 跨平台且保证最优 CIDR 繁衍） ─── */
-int patricia_insert_range_v6(patricia_node_t **root,
-                             const uint8_t *start_net, const uint8_t *end_net,
-                             rule_t *rule, int proto_idx)
+int patricia_insert_range_v6(patricia_node_t **root, const uint8_t *start_net, const uint8_t *end_net, rule_t *rule, int proto_idx)
 {
     if (root == NULL || start_net == NULL || end_net == NULL)
         return -1;
 
-    /* 解包为高低位两个 uint64_t 进行纯代数模拟 */
     uint64_t sh = 0, sl = 0, eh = 0, el = 0;
     for (int i = 0; i < 8; i++)
     {
@@ -657,20 +671,17 @@ int patricia_insert_range_v6(patricia_node_t **root,
 
     while (compare_128(sh, sl, eh, el) <= 0)
     {
-        /* 核心闭环：精准计算原始差值 diff = end - start 且绝对不加 1 避免溢出 */
         uint64_t diff_h = eh - sh;
         uint64_t diff_l = el - sl;
         if (el < sl)
             diff_h--;
 
-        /* 提取当前 start_host 的最大潜在位对齐块 */
         uint64_t block_h = 0, block_lo = 0;
         if (sl != 0)
             block_lo = sl & (-sl);
         else if (sh != 0)
             block_h = sh & (-sh);
 
-        /* 计算当前 block 块对应的 block - 1 掩码值 */
         uint64_t mask_h = 0, mask_l = 0;
         if (block_lo != 0)
         {
@@ -684,15 +695,12 @@ int patricia_insert_range_v6(patricia_node_t **root,
         }
         else
         {
-            /* start 为全 0 状态，最大掩码占满整个 128 位地球空间 */
             mask_h = 0xffffffffffffffffULL;
             mask_l = 0xffffffffffffffffULL;
         }
 
-        /* 核心数学拦截：如果发现 block - 1 > diff，说明现有容量塞不下该大块，触发收缩 */
         if (compare_128(mask_h, mask_l, diff_h, diff_l) > 0)
         {
-            /* 采用全 1 掩码递增生长法，寻找能塞进 diff 差值的最大 power-of-2 块 */
             mask_h = 0;
             mask_l = 0;
             while (1)
@@ -707,11 +715,8 @@ int patricia_insert_range_v6(patricia_node_t **root,
                         break;
                 }
                 else
-                {
                     break;
-                }
             }
-            /* 从最终的最优全 1 掩码中反向还原真实的 block 大数 */
             if (mask_l == 0xffffffffffffffffULL)
             {
                 block_lo = 0;
@@ -724,7 +729,6 @@ int patricia_insert_range_v6(patricia_node_t **root,
             }
         }
 
-        /* 计算当前最终 block 的 128 位 shift 偏移量，换算前缀位长 */
         int shift = 0;
         uint64_t th = block_h, tl = block_lo;
         while (compare_128(th, tl, 0, 1) > 0)
@@ -735,7 +739,6 @@ int patricia_insert_range_v6(patricia_node_t **root,
         }
         int bit_len = 128 - shift;
 
-        /* 打包回 16 字节网络二进制矩阵 */
         uint8_t ip6_block[16];
         for (int i = 0; i < 8; i++)
         {
@@ -743,79 +746,129 @@ int patricia_insert_range_v6(patricia_node_t **root,
             ip6_block[i + 8] = (uint8_t)(sl >> ((7 - i) * 8));
         }
 
-        /* 塞入定版的两阶段算法中 */
         if (patricia_insert(root, ip6_block, bit_len, rule, proto_idx) != 0)
-        {
             return -1;
-        }
 
-        /* 拓扑学边界判定：如果本次计算出的掩码刚好等于 diff 差值，
-         * 说明该块完美填满了剩余的所有空间，直接终结，从根本上封死 128 位大数溢出 */
         if (mask_h == diff_h && mask_l == diff_l)
             break;
 
-        /* 步长线性推进：start += block */
         uint64_t prev_sl = sl;
         sl += block_lo;
         sh += block_h;
         if (sl < prev_sl)
-            sh++; /* 跨越 64 位大数的低位向高位进位 */
+            sh++;
     }
     return 0;
 }
 
-/**
- * 工业级全兼容业务配置总入口
- * 支持 CIDR (192.168.1.0/24)、单主机 (10.1.1.1) 以及 范围区间 (172.16.253.1-172.16.253.2)
- */
 int acl_add_rule_universal(patricia_table_t *table, const char *input_str, rule_t *rule)
 {
     if (table == NULL || input_str == NULL || rule == NULL)
         return -1;
 
-    // 1. 探测是否包含范围连接符 '-'
     char *dash = strchr(input_str, '-');
     if (dash != NULL)
     {
-        /* ─── 场景 A：用户输入的是 IP 范围区间 ─── */
         char start_ip[64], end_ip[64];
         size_t start_len = dash - input_str;
 
         if (start_len >= sizeof(start_ip) || strlen(dash + 1) >= sizeof(end_ip))
-        {
             return -1;
-        }
 
-        // 切分起始和结束字符串
         strncpy(start_ip, input_str, start_len);
         start_ip[start_len] = '\0';
-        strcpy(end_ip, dash + 1);
 
-        // 智能判定是 v4 还是 v6 范围
+        /* 核心修正：统一替换为带有显式物理封底的安全函数，彻底隔绝 CWE-120 风险 */
+        strncpy(end_ip, dash + 1, sizeof(end_ip) - 1);
+        end_ip[sizeof(end_ip) - 1] = '\0';
+
         if (strchr(start_ip, ':') != NULL)
         {
-            /* IPv6 范围插入 */
             uint8_t s_net[16], e_net[16];
             if (inet_pton(AF_INET6, start_ip, s_net) != 1 || inet_pton(AF_INET6, end_ip, e_net) != 1)
-            {
                 return -1;
-            }
             int proto_idx = proto_to_idx(rule->proto);
             return patricia_insert_range_v6(&table->v6_root, s_net, e_net, rule, proto_idx);
         }
         else
         {
-            /* IPv4 范围插入 */
             struct in_addr s_addr, e_addr;
             if (inet_pton(AF_INET, start_ip, &s_addr) != 1 || inet_pton(AF_INET, end_ip, &e_addr) != 1)
-            {
                 return -1;
-            }
             int proto_idx = proto_to_idx(rule->proto);
             return patricia_insert_range_v4(&table->v4_root, ntohl(s_addr.s_addr), ntohl(e_addr.s_addr), rule, proto_idx);
         }
     }
-
-    /* ─── 场景 B：用户输入的是标准的 CIDR 或单点主机，直接原封不动调用你定版的函数 ─── */
     return acl_add_rule_string(table, input_str, rule);
+}
+void free_g_l3vpn_rules()
+{
+    if (g_l3vpn_rules.size > 0)
+    {
+        int i = 0;
+        for (i = 0; i < g_l3vpn_rules.size; i++)
+        {
+            if (g_l3vpn_rules.rule[i])
+            {
+                free(g_l3vpn_rules.rule[i]);
+                g_l3vpn_rules.rule[i] = NULL;
+            }
+        }
+        free(g_l3vpn_rules.rule);
+        g_l3vpn_rules.rule = NULL;
+        g_l3vpn_rules.size = 0;
+        g_l3vpn_rules.vaild_size = 0;
+    }
+}
+void free_g_ip_table()
+{
+    patricia_destroy(g_ip_table.v4_root);
+    patricia_destroy(g_ip_table.v6_root);
+    patricia_init_table(&g_ip_table);
+}
+void free_g_rule_table()
+{
+    free_g_l3vpn_rules();
+    free_g_ip_table();
+}
+
+rule_t *rule_new(uint8_t proto, uint16_t port_lo, uint16_t port_hi)
+{
+    rule_t *r = malloc(sizeof(*r));
+    r->proto = proto;
+    r->port_lo = port_lo;
+    r->port_hi = port_hi;
+    return r;
+}
+
+int insert_ip_rules(int af, unsigned char *start_ip, unsigned char *end_ip, rule_t *rule)
+{
+    if (rule->port_lo > rule->port_hi)
+        return -1;
+    if (af == AF_INET6)
+    {
+        // 这里只有第一个是 ip 第二个要转成int处理 当子网掩码,约定v6正常下发网段 +子网掩码 第二个46就是子网掩码
+        uint8_t s_net[16];
+        if (inet_pton(AF_INET6, start_ip, s_net) != 1)
+            return -1;
+        int mask = *(int *)(end_ip);
+        int proto_idx = proto_to_idx(rule->proto);
+
+        return patricia_insert(&g_ip_table.v6_root, s_net, 64, rule, proto_idx);
+    }
+    else if (af == AF_INET)
+    {
+        // 这里服务没办法给路由网段+子网掩码 所以这样转换处理
+        struct in_addr s_addr, e_addr;
+        if (inet_pton(AF_INET, start_ip, &s_addr) != 1 || inet_pton(AF_INET, end_ip, &e_addr) != 1)
+            return -1;
+
+        uint32_t s = ntohl(s_addr.s_addr);
+        uint32_t e = ntohl(e_addr.s_addr);
+
+        if (s > e)
+            return -1;
+        int proto_idx = proto_to_idx(rule->proto);
+        return patricia_insert_range_v4(&g_ip_table.v4_root, s, e, rule, proto_idx);
+    }
 }
